@@ -1,0 +1,1 @@
+smooth gradient from black to purple to orange to yellow for volcanic temperature or magma flow data

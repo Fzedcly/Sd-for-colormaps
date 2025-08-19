@@ -1,0 +1,1 @@
+smooth gradient from green to pink for dual-parameter overlay or special thematic maps 

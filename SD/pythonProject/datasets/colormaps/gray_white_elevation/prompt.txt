@@ -1,0 +1,1 @@
+smooth gradient from black to gray to white for elevation or grayscale intensity mapping 

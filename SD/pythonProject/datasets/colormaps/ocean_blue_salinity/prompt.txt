@@ -1,0 +1,1 @@
+smooth gradient from pale lavender to deep blue for ocean salinity or sea surface temperature data

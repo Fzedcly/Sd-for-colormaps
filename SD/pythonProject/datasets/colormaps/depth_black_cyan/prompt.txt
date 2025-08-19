@@ -1,0 +1,1 @@
+dark to light gradient from black to bluish gray to light cyan for depth or low-intensity scalar fields

@@ -1,0 +1,1 @@
+smooth gradient from light gray to sky blue to deep blue for freshwater depth or ocean layer mapping

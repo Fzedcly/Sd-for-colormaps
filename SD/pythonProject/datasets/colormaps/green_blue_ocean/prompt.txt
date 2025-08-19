@@ -1,0 +1,1 @@
+smooth gradient from light green to cyan to deep blue for coastal ocean chlorophyll mapping 

@@ -1,0 +1,1 @@
+smooth gradient from pale lavender to blue to teal for sea surface temperature or salinity visualization 

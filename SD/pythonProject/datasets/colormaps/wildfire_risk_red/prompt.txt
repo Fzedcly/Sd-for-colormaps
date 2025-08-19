@@ -1,0 +1,1 @@
+smooth gradient from light pink to deep red for heat intensity or wildfire risk visualization

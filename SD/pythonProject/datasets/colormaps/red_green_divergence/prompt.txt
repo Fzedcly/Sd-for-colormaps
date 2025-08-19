@@ -1,0 +1,1 @@
+divergent gradient from red to green for vegetation index or land classification 

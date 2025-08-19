@@ -1,0 +1,1 @@
+smooth gradient from white-gray to dark gray to black for terrain elevation or shadow intensity mapping
