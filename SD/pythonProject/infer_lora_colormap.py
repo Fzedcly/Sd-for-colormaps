@@ -1,87 +1,197 @@
 # -*- coding: utf-8 -*-
 """
-LoRA 推理脚本（适配 diffusers 0.35+ / torch 2.5+）
-- 从 ./lora_colormap_output/pytorch_lora_weights.safetensors 加载 LoRA
-- 生成示例色带图到 ./inference_outputs/
+生成左→右“黄(#FFFF00) 到 红(#FF0000)”的鲜艳、清晰颜色表（色带）
+- 强制 Img2Img + 灰度 ramp（锁定为 1D 渐变）
+- 采样器：Euler Ancestral（对纯色带更稳）
+- 关闭 Diffusers 隐形水印（避免蓝点）
+- LoRA 加载带强校验（常见权重名 + fallback）
+- 导出三份：原尺寸(256x16)、标准(256x16)、超细(256x1)
+
+在 PyCharm：
+- Script path：本文件
+- Working directory：项目根或本文件所在目录
 """
 
-import os, time, random
-from typing import Optional
+import os
+import numpy as np
+from PIL import Image
 import torch
-from diffusers import StableDiffusionPipeline
 
-# ==== 基本配置（按需改） ====
-MODEL_ID = "runwayml/stable-diffusion-v1-5"
-LORA_DIR = "./lora_colormap_output"
-LORA_FILE = "pytorch_lora_weights.safetensors"
-OUT_DIR = "./inference_outputs"
+from diffusers import (
+    StableDiffusionImg2ImgPipeline,
+    EulerAncestralDiscreteScheduler,
+)
 
-PROMPT = "smooth gradient from deep blue to teal green for ocean current visualization, clean color map, high fidelity"
-NEGATIVE_PROMPT = "text, watermark, logo, frame, noisy, artifacts, clutter"
+print("[RUNNING FILE]", __file__)  # 确认跑的是这份文件
 
-NUM_STEPS = 30           # 采样步数
-GUIDANCE = 7.5           # CFG scale
-H = W = 512              # 输出分辨率（SD1.5 默认512）
-SEED: Optional[int] = 12345  # 固定随机种子，None 则随机
+# ========= 路径与尺寸 =========
+MODEL_ID   = "runwayml/stable-diffusion-v1-5"
 
+# ★★ 改成你的 LoRA 绝对路径（建议目录里包含 pytorch_lora_weights.safetensors）
+LORA_DIR   = r"D:\Studying\Ms.zeng\SD\pythonProject\lora_colormap_output"
 
-def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
+# ★★ 改成你的输出目录绝对路径
+OUTPUT_DIR = r"D:\Studying\Ms.zeng\SD\pythonProject\inference_outputs"
 
-    # 选择 dtype：GPU 优先 float16；CPU 用 float32
-    use_cuda = torch.cuda.is_available()
-    dtype = torch.float16 if use_cuda else torch.float32
-    device = "cuda" if use_cuda else "cpu"
+# 目标横条尺寸（与需求一致）
+WIDTH, HEIGHT = 256, 16
+VERTICAL = False  # 竖条请对调宽高并设为 True
 
-    # 加载基础模型
-    pipe = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
-        safety_checker=None
-    ).to(device)
+# ========= 采样与控制（更稳） =========
+STEPS    = 30
+GUIDANCE = 4.2          # 低 CFG，减弱语义幻觉
+STRENGTH = 0.18         # 低去噪强度，强保留 ramp 形状；若上色弱可临时升至 0.35~0.50
+SEED     = 123
 
-    # 尝试加载 LoRA（优先用 pipeline API，失败回退到 unet）
-    lora_loaded = False
-    try:
-        pipe.load_lora_weights(LORA_DIR, weight_name=LORA_FILE)
-        lora_loaded = True
-    except Exception:
-        try:
-            pipe.unet.load_attn_procs(LORA_DIR, weight_name=LORA_FILE)
-            lora_loaded = True
-        except Exception as e:
-            raise RuntimeError(f"无法加载 LoRA 权重 {os.path.join(LORA_DIR, LORA_FILE)}: {e}")
-    if not lora_loaded:
-        raise RuntimeError("LoRA 未加载成功，请检查路径与文件名。")
+# LoRA 影响力（颜色更“艳”）
+LORA_WEIGHT = 1.6
 
-    # 固定随机种子
-    if SEED is None:
-        seed = random.randint(0, 2**32 - 1)
+DTYPE  = torch.float16 if torch.cuda.is_available() else torch.float32
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ========= 提示词（黄→红、鲜艳、清晰） =========
+PROMPT = (
+    "scientific colorbar, pure 1D horizontal color gradient, "
+    "left to right: yellow (#FFFF00) to red (#FF0000), "
+    "smooth, banding-free, uniform, high saturation, vivid, "
+    "no texture, no pattern, no noise, no frame, no ticks"
+)
+
+NEGATIVE = (
+    "photo, photographic, people, object, scene, background, "
+    "world map, earth, continent, ocean, terrain, relief, topography, satellite, "
+    "texture, pattern, grain, noise, artifacts, vertical stripes, streaks, bars, columns, "
+    "grid, border, frame, labels, numbers, text, watermark, banding, posterization, blur"
+)
+
+# ========= 工具函数 =========
+def make_ramp(w: int, h: int, vertical: bool = False):
+    """生成灰度 ramp（L），复制到 RGB 通道作为 Img2Img 条件图；同时返回 L 便于自检保存。"""
+    if vertical:
+        arr = np.tile(np.linspace(0, 255, h, dtype=np.uint8)[:, None], (1, w))
     else:
-        seed = SEED
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed)
+        arr = np.tile(np.linspace(0, 255, w, dtype=np.uint8)[None, :], (h, 1))
+    imgL = Image.fromarray(arr).convert("L")               # 避免 Pillow 关于 mode 的弃用警告
+    imgRGB = Image.merge("RGB", (imgL, imgL, imgL))
+    return imgRGB, imgL
 
-    # 生成
-    result = pipe(
-        prompt=PROMPT,
-        negative_prompt=NEGATIVE_PROMPT,
-        num_inference_steps=NUM_STEPS,
-        guidance_scale=GUIDANCE,
-        height=H,
-        width=W,
-        generator=generator,
+def seed_everything(seed: int):
+    if seed is None or seed < 0:
+        seed = torch.randint(0, 2**31-1, (1,)).item()
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed % (2**32 - 1))
+    return seed
+
+def try_load_lora(pipe, lora_dir: str, lora_scale: float = 1.2) -> bool:
+    """常见权重名尝试 + 目录式 + fallback attn_procs；返回是否加载成功。"""
+    loaded = False
+    names = [
+        "pytorch_lora_weights.safetensors",
+        "pytorch_lora_weights.bin",
+        "diffusers_lora.safetensors",
+        "diffusers_lora.bin",
+    ]
+    for n in names:
+        p = os.path.join(lora_dir, n)
+        if os.path.exists(p):
+            try:
+                pipe.load_lora_weights(lora_dir, weight_name=n)
+                pipe.fuse_lora(lora_scale=lora_scale)
+                print(f"[INFO] LoRA loaded weight={n}, scale={lora_scale}")
+                loaded = True
+                break
+            except Exception as e:
+                print(f"[WARN] load {n} failed:", e)
+
+    if not loaded:
+        try:
+            pipe.load_lora_weights(lora_dir, weight_name=None)
+            pipe.fuse_lora(lora_scale=lora_scale)
+            print(f"[INFO] LoRA loaded from dir, scale={lora_scale}")
+            loaded = True
+        except Exception as e:
+            print("[WARN] load_lora_weights(dir) failed:", e)
+
+    if not loaded:
+        try:
+            pipe.unet.load_attn_procs(lora_dir)
+            if hasattr(pipe, "text_encoder") and hasattr(pipe.text_encoder, "load_attn_procs"):
+                try:
+                    pipe.text_encoder.load_attn_procs(lora_dir)
+                except Exception:
+                    pass
+            print(f"[INFO] Fallback attn_procs loaded, scale={lora_scale}")
+            loaded = True
+        except Exception as e:
+            print("[ERR] fallback attn_procs failed:", e)
+
+    print("[INFO] LoRA loaded flag ->", loaded)
+    return loaded
+
+def save_resized_variants(img: Image.Image, out_dir: str):
+    """导出标准(256x16, LANCZOS) 与超细(256x1, BOX) 两份成品。"""
+    os.makedirs(out_dir, exist_ok=True)
+    p1 = os.path.join(out_dir, "colormap_256x16.png")
+    p2 = os.path.join(out_dir, "colormap_256x1.png")
+    img.resize((256, 16), Image.LANCZOS).save(p1, compress_level=0)
+    img.resize((256, 1),  Image.BOX).save(p2, compress_level=0)
+    print("Saved:", p1)
+    print("Saved:", p2)
+
+# ========= 主流程 =========
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        MODEL_ID, torch_dtype=DTYPE, safety_checker=None
     )
-    image = result.images[0]
+    # 采样器：Euler Ancestral（更服从“纯渐变”的约束）
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    pipe = pipe.to(DEVICE)
 
-    # 保存
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    out_path = os.path.join(OUT_DIR, f"colormap_{ts}_seed{seed}.png")
-    image.save(out_path)
-    print(f"✅ 推理完成：{out_path}")
-    print(f"Prompt: {PROMPT}")
-    print(f"Seed:   {seed} | Steps: {NUM_STEPS} | CFG: {GUIDANCE} | Size: {W}x{H}")
+    # 关闭隐形水印（防蓝点）
+    if hasattr(pipe, "watermark"):
+        pipe.watermark = None
+    if hasattr(pipe, "set_watermark"):
+        try:
+            pipe.set_watermark(None)
+        except Exception:
+            pass
 
+    ok = try_load_lora(pipe, LORA_DIR, lora_scale=LORA_WEIGHT)
+    assert ok, "❌ LoRA 未成功加载：请检查 LORA_DIR 路径/文件名（建议使用绝对路径与 pytorch_lora_weights.safetensors）"
+
+    # 生成 ramp 并保存调试图
+    init_rgb, init_L = make_ramp(WIDTH, HEIGHT, vertical=VERTICAL)
+    init_L_path = os.path.join(OUTPUT_DIR, "_debug_ramp.png")
+    init_L.save(init_L_path, compress_level=0)
+    print("[INFO] init ramp size =", init_rgb.size, "| saved:", init_L_path)
+
+    seed = seed_everything(SEED)
+    print("[INFO] Seed =", seed)
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+
+    out = pipe(
+        prompt=PROMPT,
+        negative_prompt=NEGATIVE,
+        image=init_rgb,
+        strength=STRENGTH,
+        guidance_scale=GUIDANCE,
+        num_inference_steps=STEPS,
+        generator=gen,
+    ).images[0]
+
+    print("[INFO] output size =", out.size)
+    assert out.size == init_rgb.size, "❌ 输出尺寸 != ramp 尺寸（Run 配置或流程有误）"
+
+    base = f"colormap_seed{seed}_{WIDTH}x{HEIGHT}.png"
+    p0 = os.path.join(OUTPUT_DIR, base)
+    out.save(p0, compress_level=0)
+    print("Saved:", p0)
+
+    # 导出标准与超细两份
+    save_resized_variants(out, OUTPUT_DIR)
+    print("🎉 完成！")
 
 if __name__ == "__main__":
     main()
